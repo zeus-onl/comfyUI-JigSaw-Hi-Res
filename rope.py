@@ -92,7 +92,74 @@ def rope_dype(pos: torch.Tensor, dim: int, theta: int, **kwargs) -> torch.Tensor
 
     omega = _scaled_omega(dim, theta, device, **kwargs)
 
-    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega.to(torch.float32))
+    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega)
     out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
+    return out.to(dtype=torch.float32, device=pos.device)
+
+
+def _correction_factor(num_rotations, dim, theta, ori_len):
+    # frequency index whose wavelength fits num_rotations times into ori_len
+    return (dim * math.log(ori_len / (num_rotations * 2 * math.pi))) / (2 * math.log(theta))
+
+
+def _ramp_mask(low_ratio, high_ratio, dim, theta, ori_len, device):
+    # clamped on both ends: past dim // 2 the ramp would flip and interpolate every band
+    low = min(max(math.floor(_correction_factor(low_ratio, dim, theta, ori_len)), 0), dim // 2)
+    high = min(math.ceil(_correction_factor(high_ratio, dim, theta, ori_len)), dim // 2)
+    if low == high:
+        high += 0.001
+    ramp = (torch.arange(dim // 2, dtype=torch.float64, device=device) - low) / (high - low)
+    return 1.0 - torch.clamp(ramp, 0.0, 1.0)  # 1 = keep the higher-precision branch
+
+
+def dype_axis_rope(
+    pos: torch.Tensor,
+    dim: int,
+    theta: float,
+    scale: float,
+    ori_len: int = 64,
+    noise_level: float = 1.0,
+    method: str = "yarn",
+    dype: bool = True,
+    rope_percentage: float = 1.0,
+) -> torch.Tensor:
+    """
+    Dy-YaRN / Dy-NTK from the official DyPE code (github.com/guyyariv/DyPE,
+    flux/transformer_flux.py), in the comfy.ldm.flux.math.rope() output format.
+
+    scale: target / trained extent of this axis (in tokens), ori_len: trained
+    extent. noise_level: t in [0, 1], 1 = pure noise; with dype the scaling is
+    strongest there (kappa(t) = t^2) and fades to the trained frequencies at t = 0.
+    """
+    assert dim % 2 == 0
+    if not comfy.model_management.supports_fp64(pos.device):
+        device = torch.device("cpu")
+    else:
+        device = pos.device
+
+    exps = torch.arange(0, dim, 2, dtype=torch.float64, device=device) / dim
+    omega = 1.0 / (theta ** exps)
+    mscale = 1.0
+
+    if method != "base" and scale > 1.0:
+        kappa = max(float(noise_level), 0.0) ** 2.0 if dype else 1.0
+        if method == "ntk":
+            base_ntk = scale ** (dim / (dim - 2))
+            ntk_factor = max(1.0, base_ntk ** (2.0 * kappa) if dype else base_ntk)
+            omega = 1.0 / ((theta * ntk_factor) ** exps)
+        else:
+            kappa = max(kappa, 1e-6)  # kappa = 0 would put the thresholds at infinite wavelength
+            omega_linear = omega / scale
+            omega_ntk = 1.0 / ((theta * scale ** (dim / (dim - 2))) ** exps)
+            mask = _ramp_mask(1.25 * kappa, 0.75 * kappa, dim, theta, ori_len, device)
+            blended = omega_linear * (1 - mask) + omega_ntk * mask
+            mask = _ramp_mask(16 * kappa, 2 * kappa, dim, theta, ori_len, device)
+            omega = blended * (1 - mask) + omega * mask
+            mscale = 0.1 * math.log(scale) + 1.0
+
+    omega = omega * rope_percentage
+    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=device), omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1) * mscale
     out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
     return out.to(dtype=torch.float32, device=pos.device)
